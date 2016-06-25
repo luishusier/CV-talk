@@ -1,0 +1,436 @@
+---
+title: "Cross-validation in R and Stan"
+author: "Luis Usier"
+date: "June 24, 2016"
+output: ioslides_presentation
+---
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+options(digits = 2, scipen = 99)
+knitr::opts_chunk$set(comment = NA)
+library(rstan)
+library(dplyr)
+library(purrr)
+library(magrittr)
+library(loo)
+```
+
+## Goalkeepers
+
+```{r keepers, echo=FALSE}
+keepers <- c("Cech", "Courtois", "De Gea", "Hart", "Lloris")
+rates <- rnorm(5, 1, .5) %>% plogis
+shots <- rpois(5, 40)
+
+shot_data <- data_frame(
+  keeper = map2(keepers, shots, rep) %>% as_vector,
+  save = map2(shots, rates, rbernoulli) %>% as_vector
+) %>% sample_n(nrow(.))
+
+print(shot_data)
+```
+
+## Bayesian Data Analysis
+
+1. Set up probability model:
+    + denote saves by $s$ and goals by $g$
+    + $s_i \sim Bern(p_{k_i})$
+2. Solve for posterior distribution:
+    + analytically in this case
+    + $p_{k_i} \sim Beta(\sum s_{k_i}, \sum g_{k_i})$
+
+## Bayesian Data Analysis
+
+```{r simple_post, echo=FALSE}
+shot_summary <- shot_data %>% 
+  group_by(keeper) %>%
+  summarize(alpha = sum(save),
+            beta = sum(!save),
+            mean = mean(save))
+
+print(shot_summary)
+```
+
+## Going Hierarchical
+
+This model is too simple:
+
+  + Information about one keeper tells us about the other keepers
+  + What do we do with new keepers?
+  + Make the model *hierarchical*
+  
+## Going Hierarchical
+
+Keeper skills normally distributed:
+
+$$\pi_k \sim N(\mu, 0.5)$$
+
+Map skills from real numbers to $[0,1]$:
+
+$$p_k = \dfrac{1}{1 + e^{\pi_k}}$$
+
+Saves are Bernoulli trials:
+
+$$s_i \sim Bern(p_{k_i})$$
+
+## Going Hierarchical {.smaller}
+
+No analytical solution; must fit in Stan.
+
+```{r half-model, cache =TRUE, engine='stan', engine.opts=list(x = 'h_model')}
+data {
+  int shots; int keepers;
+  int save[shots]; int keeper[shots];
+}
+parameters {
+  real mu;
+  vector[keepers] pi;
+}
+transformed parameters{
+  vector[keepers] p;
+  
+  for (i in 1:keepers) 
+    p[i] <- 1 / (1 + exp(-pi[i]));
+}
+model {
+  pi ~ normal(mu, 1);
+  
+  for (i in 1:shots)
+    save[i] ~ bernoulli(p[keeper[i]]);
+}
+```
+
+## Going Hierarchical {.smaller}
+
+```{r fit, echo=FALSE, include=FALSE}
+model_data <- list(shots = shot_data %>% nrow,
+                   keepers = shot_data$keeper %>% n_distinct,
+                   save = shot_data$save,
+                   keeper = shot_data$keeper %>% as.factor %>% as.numeric)
+
+fit <- sampling(h_model, model_data, chains = 1)
+
+```
+
+```{r show fit, echo=FALSE}
+fit %>% 
+  summary(pars = "p") %$% 
+  summary %>% 
+  as.data.frame %>% 
+  as_data_frame %>% 
+  mutate(keeper = keepers, true = rates) %>%
+  select(keeper, mean, `2.5%`, `97.5%` = `98%`, true) #???
+```
+
+## Scale Parameters
+
+Back to the model:
+
+$$\pi_k \sim N(\mu, \textbf{0.5})$$
+
+How did we choose 0.5???
+
+Ideally, should be estimated from the data just like other parameters:
+
+$$\pi_k \sim N(\mu, \sigma)$$
+
+## Scale Parameters {.smaller}
+
+```{r full model, cache =TRUE, engine='stan', engine.opts=list(x = 'f_model')}
+data {
+  int shots; int keepers;
+  int save[shots]; int keeper[shots];
+}
+parameters {
+  real mu;
+  real<lower=0> sigma;
+  vector[keepers] pi;
+}
+transformed parameters{
+  vector[keepers] p;
+  
+  for (i in 1:keepers) 
+    p[i] <- 1 / (1 + exp(-pi[i]));
+}
+model {
+  pi ~ normal(mu, sigma);
+  
+  for (i in 1:shots)
+    save[i] ~ bernoulli(p[keeper[i]]);
+}
+```
+
+## Scale Parameters {.smaller}
+
+```{r full fit, echo=FALSE, include=FALSE}
+fit <- sampling(f_model, model_data, chains = 1)
+```
+
+```{r show full fit, echo=FALSE}
+flat <- fit %>% 
+  summary(pars = c("mu", "sigma", "p", "lp__")) %$% 
+  summary %>% 
+  as.data.frame %>% 
+  add_rownames("parameter") %>%
+  as_data_frame %>% 
+  select(parameter, mean, `2.5%`, `97.5%` = `98%`) %>% #???
+  mutate(true = c(1, .5, rates, NA)) %>%
+  print
+```
+
+Seems fine... **but** there are hidden problems.
+
+## Scale Parameters {.smaller}
+
+Adding the ML estimates from Stan's built-in optimizer:
+
+```{r mle fit, echo=FALSE, include=FALSE}
+opt <- optimizing(f_model, model_data, iter = 100, init = list(
+  mu = 1, sigma = 0.001, pi = rep(0, 5)
+)) %>% 
+  flatten %>% 
+  as_vector
+
+names(opt)[13] <- "lp__"
+```
+
+```{r mle, echo=FALSE}
+flat %>% mutate(MLE = opt[parameter])
+```
+
+The posterior distribution is unbounded, and thus **improper**.
+
+As a result, the assumptions that underlie MCMC break down and, in general,
+sampling will not be meaningful.
+
+The problem is worse for models with more levels and more variance parameters,
+and/or more groups.
+
+## Cross-validating parameters
+
+If you're building deep hierarchical models in Stan, sooner or later you may
+run into this problem.
+
+When that happens, cross-validation is an alternative.
+
+## Cross-validating parameters
+
+In cross-validation, we:
+
+1. Fit the model on a subset of the data
+2. See how well the model predicts the outstanding data
+3. Select amongst the models according to their predictive accuracy
+
+## Cross-validating parameters
+
+Ideally, the subsets of the data would be of size n - 1
+
+The problem: running one model takes long enough, running n would take forever
+
+The package `loo` implements an algorithm that approximates leave-one-out
+cross-validation in RStan.
+
+## Cross-validating parameters {.smaller}
+
+```{r loo model, cache =TRUE, engine='stan', engine.opts=list(x = 'l_model')}
+data {
+  int shots; int keepers;
+  int save[shots]; int keeper[shots];
+  real<lower=0> sigma;
+}
+parameters {
+  real mu; vector[keepers] pi;
+}
+transformed parameters{
+  vector[keepers] p;
+  for (i in 1:keepers) 
+    p[i] <- 1 / (1 + exp(-pi[i]));
+}
+model {
+  pi ~ normal(mu, sigma);
+  for (i in 1:shots)
+    save[i] ~ bernoulli(p[keeper[i]]);
+}
+generated quantities {
+  vector[shots] log_lik;
+  for (i in 1:shots)
+    log_lik[i] <- bernoulli_log(save[i], p[keeper[i]]);
+}
+```
+
+## Cross-validating parameters {.smaller}
+
+```{r loo fit, echo=FALSE, include=FALSE}
+fit25 <- sampling(l_model, c(model_data, list(sigma = .25)), chains = 1)
+fit50 <- sampling(l_model, c(model_data, list(sigma = .50)), chains = 1)
+fit100 <- sampling(l_model, c(model_data, list(sigma = 1)), chains = 1)
+```
+
+```{r loo results}
+list(fit25, fit50, fit100) %>%
+  map(extract_log_lik) %>% map(loo) %>% walk(print)
+```
+
+## Cross-validating models
+
+The same principle can be applied when comparing two different models altogether
+
+Suppose that in our initial model we had used a different link function:
+probit instead of logistic
+
+$$p_k = \Phi(\pi_k)$$
+
+```{r logistic, cache =TRUE, echo=FALSE, include=FALSE, engine='stan', engine.opts=list(x = 'log_model')}
+data {
+  int shots; int keepers;
+  int save[shots]; int keeper[shots];
+}
+parameters {
+  vector[keepers] pi;
+}
+transformed parameters{
+  vector[keepers] p;
+  
+  for (i in 1:keepers) 
+    p[i] <- 1 / (1 + exp(-pi[i]));
+}
+model {
+  pi ~ normal(1, .5);
+  for (i in 1:shots)
+    save[i] ~ bernoulli(p[keeper[i]]);
+}
+generated quantities {
+  vector[shots] log_lik;
+  for (i in 1:shots)
+    log_lik[i] <- bernoulli_log(save[i], p[keeper[i]]);
+}
+```
+
+```{r probit, cache =TRUE, echo=FALSE, include=FALSE, engine='stan', engine.opts=list(x = 'prob_model')}
+data {
+  int shots; int keepers;
+  int save[shots]; int keeper[shots];
+}
+parameters {
+  vector[keepers] pi;
+}
+transformed parameters{
+  vector[keepers] p;
+  
+  for (i in 1:keepers) 
+    p[i] <- Phi(pi[i]);
+}
+model {
+  pi ~ normal(1, .5);
+  for (i in 1:shots)
+    save[i] ~ bernoulli(p[keeper[i]]);
+}
+generated quantities {
+  vector[shots] log_lik;
+  for (i in 1:shots)
+    log_lik[i] <- bernoulli_log(save[i], p[keeper[i]]);
+}
+```
+
+## Cross-validating models {.smaller}
+
+```{r links fit, echo=FALSE, include=FALSE}
+fit_log <- sampling(log_model, c(model_data), chains = 1)
+fit_prob <- sampling(prob_model, c(model_data), chains = 1)
+```
+
+```{r links results}
+list(fit_log, fit_prob) %>%
+  map(extract_log_lik) %>% map(loo) %>% walk(print)
+```
+
+## Cross-validating time series
+
+```{r poll, echo=FALSE}
+n <- 30
+t <- rpois(n, 1) %>% add(1)
+beta <- .01
+y <- rnorm(1, 0, .25)
+for (i in 2:n) {
+  y[i] <- rnorm(1, y[i-1] * exp(-beta * t[i]), sqrt(1 - exp(-beta * t[i]) ^ 2))
+}
+p <- plogis(y)
+r <- integer(n)
+for (i in 1:n){
+  r[i] <- rbinom(1, 200, p[i])
+}
+```
+
+Take now a slightly more complicated time series model:
+
+Underlying propensities are a stochastic function of time:
+
+$$y_{t+1} \sim N(y_t e^{-\beta \Delta t},
+\sigma \sqrt{1 - (e^{-\beta \Delta t}) ^ 2})$$
+
+$$p_t = \dfrac{1}{1 + e^{-y_t}}$$
+
+Binomial poll results:
+
+$$rem_t \sim Binom(200, p_t)$$
+
+## Cross-validating time series
+
+Parameters of interest: individual $y_t$, $\sigma$ and $\beta$
+
+Finding out just the individual $y_t$ would be very easy, 
+but also not very informative or predictive
+
+However, $\sigma$ and $\beta$ cannot be easily fit because again, 
+the likelihood is unbounded
+
+## Cross-validating time series {.smaller}
+
+In Stan:
+
+```{r time series, cache =TRUE, engine='stan', engine.opts=list(x = 'ts_model')}
+data {
+  int n; int t[n]; int r[n];
+}
+parameters {
+  real<lower=0> beta; real<lower=0> sigma;
+  vector[n] y;
+}
+transformed parameters {
+  vector[n] p;
+  for (i in 1:n)
+    p[i] <- 1 / (1 + exp(-y[i]));
+}
+model {
+  y[1] ~ normal(0, sigma);
+  for (i in 2:n)
+    y[i] ~ normal(y[i-1] * exp(-beta * t[i]), sigma * sqrt(1 - exp(-beta * t[i]) ^ 2));
+  r ~ binomial(200, p);
+}
+```
+
+## Cross-validating time series {.smaller}
+
+```{r ts try, echo=FALSE, include=FALSE}
+ts_data <- list(n = n, t = t, r = r)
+
+ts_fit <- optimizing(ts_model, ts_data)
+```
+
+```{r show ts fit, echo=FALSE}
+data_frame(parameter = ts_fit %$% par %>% names,
+           estimate = ts_fit %$% par,
+           actual = c(beta, .25, y, p))
+```
+
+## Cross-validating time series {.smaller}
+
+Again, cross validation is in due order
+
+In order to perform leave-one-out, using the 30 datapoints, can use `loo`
+
+However, there are theoretical reasons to prefer **sequential**
+cross-validation, using first just the first n polls, then polls 2 to n + 1,
+3 to n + 2...
+
+This is not implemented in `loo`; leave-one-out should suffice for most purposes
